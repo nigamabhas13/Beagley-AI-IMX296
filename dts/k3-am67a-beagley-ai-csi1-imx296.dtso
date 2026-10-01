@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * BeagleY-AI, CSI1 22-pin connector: Sony IMX296
+ * (Raspberry Pi Global Shutter Camera and compatible modules)
+ *
+ * The second camera connector.  Its I2C bus is main_i2c0, shared with the
+ * DSI0 connector - the base DTB carries the symbol "dsi0_csi1_i2c" for it -
+ * and it is already enabled by default (400 kHz, pinctrl set), so this
+ * overlay leaves the bus node itself alone.
+ *
+ * SoC side: CSI2RX1 (ticsi2rx@30122000 / csi-bridge@30121000) with D-PHY1
+ * (phy@30130000).  That pairing is fixed inside the SoC's own device tree
+ * (ticsi2rx@30122000 has phys = <&dphy1>), so there is nothing to guess.
+ *
+ * Module power enable - measured, not guessed:
+ *   The base DTB defines the pin group csi1_gpio_pins_default (main padconf
+ *   offset 0x1d8) but NOTHING in the vendor tree references it, so on a stock
+ *   boot that pad is never muxed to GPIO and a module on CSI1 is dead.  The
+ *   pin is main_gpio1 line 24.  Driving it high from userspace (after muxing
+ *   the pad by hand) makes the sensor answer at 0x1a on /dev/i2c-3; driving
+ *   it low makes the bus go silent.  So: high = module powered, like the
+ *   Raspberry Pi's CAM_GPIO.
+ *
+ *   The driver's "reset" GPIO cannot express this: imx296_power_on() drives
+ *   reset to logic 0 (imx296.c:262), which with GPIO_ACTIVE_HIGH would switch
+ *   the module OFF.  As on CSI0, the pin is therefore owned by a fixed
+ *   regulator instead, which asserts it for the whole time the driver holds
+ *   the supplies on, and gives the module a 500 ms ramp before the first I2C
+ *   access.  No reset-gpios property.
+ *
+ *  - avdd is that regulator; dvdd/ovdd are generated on the camera module
+ *    itself, so they are dummies (the voltage values below are nominal).
+ *  - "inck" is a fixed-clock, as on CSI0: the 22-pin connector has no MCLK,
+ *    so the module carries its own oscillator.  54 MHz is one of the three
+ *    rates the driver accepts (37.125 / 54 / 74.25 MHz).
+ *  - One data lane at a 594 MHz link (1188 Mbps per lane is hardwired in the
+ *    driver) with a non-continuous clock lane, as on Raspberry Pi.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&{/} {
+	clk_imx296_csi1: clock-imx296-csi1 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <54000000>;
+	};
+
+	/* Module power: main_gpio1 line 24 (pad 0xf41d8) -> 22-pin pin 11. */
+	reg_cam1_pwr: regulator-cam1-pwr {
+		compatible = "regulator-fixed";
+		regulator-name = "cam1-pwr-en";
+		pinctrl-names = "default";
+		pinctrl-0 = <&csi1_gpio_pins_default>;
+		gpio = <&main_gpio1 24 0>;	/* 0 = GPIO_ACTIVE_HIGH */
+		enable-active-high;
+
+		/*
+		 * Measured, not guessed.  With 500 ms the driver's probe failed
+		 * on every boot with
+		 *   imx296 3-001a: failed to read sensor information (-110)
+		 * The CTRL00 write still got through (so the module was powered)
+		 * and the SENSOR_INFO read is what timed out.  Holding the pin
+		 * high from userspace and re-probing showed the sensor answers
+		 * as soon as it has had ~1.5 s of power:
+		 *   imx296 3-001a: found IMX296LQ (35.9C)
+		 * 2 s is that with margin, and is only paid on a real 0 -> 1
+		 * enable: regulator_enable() on an already-enabled regulator is
+		 * a refcount bump and does not sleep.
+		 */
+		startup-delay-us = <2000000>;
+
+		/*
+		 * Keep the pin high for as long as the board is on.  The driver
+		 * autosuspends one second after streaming stops and disables its
+		 * supplies, so without this every capture start would pay the
+		 * delay above again.  With always_on the regulator core never
+		 * runs the hardware disable - _regulator_disable()'s last-user
+		 * branch also requires !always_on - so the pin stays high and the
+		 * module is powered from early boot.  That is exactly the
+		 * situation on a Raspberry Pi, where the module is powered from
+		 * boot and the driver's own 2-5 ms standby-release timing is
+		 * therefore enough.
+		 */
+		regulator-always-on;
+	};
+	/* No vin-supply: which rail this pin switches on CSI1 is not
+	 * documented in the vendor tree, and the regulator works without it. */
+
+	/*
+	 * Rails generated on the camera module.  They exist only to satisfy
+	 * the driver's mandatory regulator_bulk_get(avdd, dvdd, ovdd).
+	 */
+	reg_cam1_dvdd: regulator-cam1-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam1-dvdd";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+	};
+
+	reg_cam1_ovdd: regulator-cam1-ovdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam1-ovdd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+};
+
+&main_i2c0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	sensor@1a {
+		compatible = "sony,imx296";
+		reg = <0x1a>;
+
+		clocks = <&clk_imx296_csi1>;
+		clock-names = "inck";
+
+		avdd-supply = <&reg_cam1_pwr>;
+		dvdd-supply = <&reg_cam1_dvdd>;
+		ovdd-supply = <&reg_cam1_ovdd>;
+
+		port {
+			imx296_csi1_out: endpoint {
+				remote-endpoint = <&csi2rx1_in_sensor>;
+				link-frequencies = /bits/ 64 <594000000>;
+				clock-lanes = <0>;
+				data-lanes = <1>;
+				clock-noncontinuous;
+			};
+		};
+	};
+};
+
+&cdns_csi2rx1 {
+	/*
+	 * Interrupts, corrected.  The vendor tree gives this node the two
+	 * main_i2c0/main_i2c1 interrupts (SPI 161/162 = GIC 193/194), which
+	 * cannot work - both controllers already own them - and at boot the
+	 * bridge is refused:
+	 *
+	 *   genirq: Flags mismatch irq 73. 00000004 (30121000.csi-bridge)
+	 *                                    vs. 00006004 (20000000.i2c)
+	 *   cdns-csi2rx 30121000.csi-bridge: Unable to request interrupt: -16
+	 *
+	 * TI's own tree (ti-linux-6.12.y) and mainline both give CSI2RX1
+	 * SPI 146/147 under these same names, and no other node in this tree
+	 * claims either number.  The vendor tree mis-assigns interrupts on
+	 * several of the CSI bridges (SPI 156 really is MCAN0's int1, 232 is
+	 * a USB controller's), so this is a per-node bug, not a naming
+	 * convention we are misreading.
+	 */
+	interrupts = <0 146 4>, <0 147 4>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			status = "okay";
+
+			csi2rx1_in_sensor: endpoint {
+				remote-endpoint = <&imx296_csi1_out>;
+				bus-type = <4>;		/* MIPI CSI-2 D-PHY */
+				clock-lanes = <0>;
+				data-lanes = <1>;
+				clock-noncontinuous;
+			};
+		};
+	};
+};
+
+&ti_csi2rx1 {
+	status = "okay";
+};
+
+&dphy1 {
+	status = "okay";
+};
+
+/*
+ * The CSI1 connector's MIPI lanes are shared with the DSI0 connector through
+ * an on-board switch, and the vendor tree's "mipi-switch" gpio-leds node
+ * drives it to its OFF state at every boot:
+ *
+ *   state = SEL + 2*OE :  0 = DSI0, 1 = CSI1, 2/3 = lanes disconnected
+ *
+ *   oe-pin  = main_gpio0 line 1, default-state "on"  -> OE = 1  |
+ *   sel-pin = main_gpio0 line 2, default-state "off" -> SEL = 0 |  = state 2
+ *
+ * (mainline's k3-am67a-beagley-ai.dts defines the same pins as a "gpio-mux"
+ * with idle-state = <2>, and its CSI1 imx219 overlay sets idle-state = <1>;
+ * this kernel has no gpio-mux driver, so the LED node is what we get to use.)
+ *
+ * Everything else on the connector - I2C0, power - is NOT behind the switch,
+ * which is why probing and streaming all looked healthy while no pixel data
+ * ever reached the SoC.  Measured: flipping the two LEDs to OE=0/SEL=1 makes
+ * frames arrive.  Flip the defaults so the switch sits on the camera from
+ * early boot.
+ */
+&{/mipi-switch} {
+	oe-pin {
+		default-state = "off";		/* OE = 0: switch outputs on */
+	};
+
+	sel-pin {
+		default-state = "on";		/* SEL = 1: connector -> CSI1 */
+	};
+};

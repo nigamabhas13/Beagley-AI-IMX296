@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * BeagleY-AI, CSI0 22-pin connector: Sony IMX296
+ * (Raspberry Pi Global Shutter Camera and compatible modules)
+ *
+ * Layout follows the vendor overlay for this connector,
+ * k3-am67a-beagley-ai-csi0-imx219.dtbo: same I2C bus (main_i2c2), same
+ * pinctrl groups, same CSI_GPIO1 = MCU_GPIO0_15 for module power, same
+ * Cadence CSI2RX bridge / D-PHY / TI CSI2RX targets.
+ *
+ * IMX296 specifics:
+ *  - avdd/dvdd/ovdd supplies are mandatory (regulator_bulk_get()).
+ *    Only avdd is real here: it is CSI_GPIO1, which switches the whole
+ *    module.  dvdd/ovdd are generated on the camera module itself, so
+ *    they are dummies (the voltage values below are nominal).
+ *  - The module carries its own 54 MHz oscillator: the 22-pin connector
+ *    has no MCLK, so the driver's "inck" is a fixed-clock.  54 MHz is one
+ *    of the three rates the driver accepts (37.125 / 54 / 74.25 MHz).
+ *  - No reset-gpios.  imx296_power_on() drives a reset GPIO to logic 0;
+ *    on this pin (module PWR EN, active high) that would switch the
+ *    module off.  PWR EN is owned by the regulator instead, which also
+ *    gives the module a 500 ms ramp before the driver's first I2C access.
+ *  - One data lane at 594 MHz link (1188 Mbps/lane is hardwired in the
+ *    driver) with a non-continuous clock lane, as on Raspberry Pi.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&{/} {
+	clk_imx296_csi0: clock-imx296-csi0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <54000000>;
+	};
+
+	/* Module power: CSI_GPIO1 (MCU_GPIO0_15) -> 22-pin pin 11 (PWR EN). */
+	reg_cam0_pwr: regulator-cam0-pwr {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0-pwr-en";
+		pinctrl-names = "default";
+		pinctrl-0 = <&csi0_gpio_pins_default>;
+		gpio = <&mcu_gpio0 15 0>;		/* 0 = GPIO_ACTIVE_HIGH */
+		enable-active-high;
+		startup-delay-us = <500000>;
+		vin-supply = <&vdd_3v3>;
+	};
+
+	/*
+	 * Rails generated on the camera module.  They exist only to satisfy
+	 * the driver's mandatory regulator_bulk_get(avdd, dvdd, ovdd).
+	 */
+	reg_cam0_dvdd: regulator-cam0-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0-dvdd";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+	};
+
+	reg_cam0_ovdd: regulator-cam0-ovdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0-ovdd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+};
+
+&main_i2c2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&main_i2c2_pins_default>;
+	clock-frequency = <400000>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	sensor@1a {
+		compatible = "sony,imx296";
+		reg = <0x1a>;
+
+		clocks = <&clk_imx296_csi0>;
+		clock-names = "inck";
+
+		avdd-supply = <&reg_cam0_pwr>;
+		dvdd-supply = <&reg_cam0_dvdd>;
+		ovdd-supply = <&reg_cam0_ovdd>;
+
+		port {
+			imx296_out: endpoint {
+				remote-endpoint = <&csi2rx0_in_sensor>;
+				link-frequencies = /bits/ 64 <594000000>;
+				clock-lanes = <0>;
+				data-lanes = <1>;
+				clock-noncontinuous;
+			};
+		};
+	};
+};
+
+&cdns_csi2rx0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			status = "okay";
+
+			csi2rx0_in_sensor: endpoint {
+				remote-endpoint = <&imx296_out>;
+				bus-type = <4>;		/* MIPI CSI-2 D-PHY */
+				clock-lanes = <0>;
+				data-lanes = <1>;
+				clock-noncontinuous;
+			};
+		};
+	};
+};
+
+&ti_csi2rx0 {
+	status = "okay";
+};
+
+&dphy0 {
+	status = "okay";
+};

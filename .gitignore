@@ -1,0 +1,56 @@
+# Build artifacts
+*.o
+*.ko
+*.so
+*.a
+*.d
+*.tmp
+
+# Generated binaries / temporary DCC output
+*.bin
+*.raw
+*.yuv
+
+# Camera captures / recordings
+*.h264
+*.mp4
+*.mkv
+*.avi
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# C/C++ build directories
+build/
+Build/
+out/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.swp
+*.swo
+*~
+
+# ROS
+.devel/
+install/
+log/
+
+# Local environment/config
+.env
