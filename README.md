@@ -203,3 +203,43 @@ The repository wrapper expects the TI Imaging installation at `$HOME/ti_imaging/
 This repository contains both project-specific work and Texas Instruments-derived material. See `licenses/README.md` and `licenses/TI-TEXT-FILE-LICENSE.txt` for the licensing information applicable to the TI-derived DCC material.
 
 The IMX296 driver source and device-tree overlays retain their existing source-file license identifiers.
+
+## Helper Scripts
+
+### Configure the CSI pipeline
+
+On the BeagleY-AI:
+
+```bash
+./scripts/setup_media.sh
+```
+
+### Capture raw frames
+
+On the BeagleY-AI:
+
+```bash
+./scripts/capture_raw.sh
+```
+
+### Generate DCC binaries
+
+On a host containing the TI Imaging DCC tools:
+
+```bash
+./scripts/generate_dcc.sh
+```
+
+The generated files are written to `dcc/generated/` and are intentionally ignored by Git.
+
+### Stream from the BeagleY-AI
+
+```bash
+./scripts/stream_udp.sh <HOST_IP> [PORT]
+```
+
+### Receive on the host PC
+
+```bash
+./scripts/receive_udp.sh [PORT]
+```
