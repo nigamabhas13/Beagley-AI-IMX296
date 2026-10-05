@@ -46,41 +46,34 @@ the BeagleY-AI.
 ## Working Camera Pipeline
 
 ```text
-IMX296
-   |
-   v
-CSI-2
-   |
-   v
-TI CSI2RX
-   |
-   v
-V4L2 (/dev/video2)
-   |
-   v
-TI TIOVX ISP
-   |
-   v
-NV12
-   |
-   +--------------------> VIO / computer vision
-   |
-   +--> GStreamer --> H.264 --> RTP/UDP --> Host PC
+                         +--> TI TIOVX ISP --> NV12 --> VIO / CV
+                         |
+IMX296 --> CSI-2 --> CSI2RX --> V4L2
+                         |
+                         +--> imx296-capture --> YUYV 1280x720
+                                                    |
+                                                    +--> JPEG --> RTP/UDP --> Host
+                                                    |
+                                                    +--> H.264 --> RTP/UDP --> Host
 ```
+
+The `imx296-capture` path is the current canonical live-stream path.
+The TI TIOVX/DCC path remains available for ISP processing and validation.
 
 ## Known Working Configuration
 
 | Parameter | Value |
 |---|---|
-| Resolution | 1456 × 1088 |
+| Sensor resolution | 1456 × 1088 |
 | Bayer format | SBGGR10 / BGGR10 |
-| Frame rate | 30 FPS |
+| Sensor target rate | 30 FPS |
 | Capture node | `/dev/video2` |
-| ISP | TI TIOVX ISP |
+| Raw pixel format | `BG10` |
+| ISP | TI TIOVX |
 | ISP output | NV12 |
-| Streaming resolution | 1280 × 720 |
-| Encoder | `v4l2h264enc` |
-| Transport | RTP / UDP |
+| Live-stream geometry | 1280 × 720 |
+| Recommended stream | JPEG/RTP over UDP |
+| Alternative stream | H.264/RTP over UDP |
 | UDP port | 5000 |
 
 ## IMX296 ISP / DCC Configuration
@@ -139,46 +132,81 @@ The appropriate exposure and gain depend on the lighting environment. Fixed expo
 
 ## UDP Streaming
 
-### BeagleY-AI
+The recommended live-stream path uses the repository capture utility to convert the IMX296 10-bit Bayer stream into YUYV 1280 × 720, followed by JPEG/RTP over UDP.
 
-Run the following pipeline on the BeagleY-AI. Replace `<HOST_IP>` with the IP address of the receiving computer.
+### Build the capture tool
+
+On the BeagleY-AI:
 
 ```bash
-sudo gst-launch-1.0 -q \
-    v4l2src device=/dev/video2 io-mode=5 ! \
-    'video/x-bayer,format=bggr10,width=1456,height=1088,framerate=30/1' ! \
-    tiovxisp \
-        sensor-name=SENSOR_SONY_IMX296_RPI \
-        dcc-isp-file=/opt/imaging/imx296/linear/dcc_viss.bin \
-        format-msb=9 \
-        sink_0::dcc-2a-file=/opt/imaging/imx296/linear/dcc_2a.bin \
-        sink_0::ae-mode=2 \
-        sink_0::awb-mode=0 \
-        sink_0::device=/dev/v4l-subdev2 ! \
-    'video/x-raw,format=NV12,width=1456,height=1088' ! \
-    videoscale ! \
-    'video/x-raw,format=NV12,width=1280,height=720,framerate=30/1' ! \
-    queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! \
-    v4l2h264enc ! \
-    h264parse config-interval=1 ! \
-    rtph264pay pt=96 config-interval=1 mtu=1400 ! \
-    udpsink host=<HOST_IP> port=5000 sync=false async=false
+cd tools
+gcc -O2 -o imx296-capture imx296-capture.c
 ```
 
-### Ubuntu Receiver
+### JPEG/RTP — Recommended
 
-Run the following pipeline on the receiving Ubuntu computer:
+On the BeagleY-AI:
+
+```bash
+./scripts/stream_udp.sh <HOST_IP> [PORT]
+```
+
+The default UDP port is `5000`.
+
+The script uses:
+
+- `imx296-capture` at 30 FPS
+- BGGR Bayer order
+- 1280 × 720 center crop
+- JPEG encoding at quality 75
+- RTP/JPEG payload type 26
+- UDP transport
+
+On the Ubuntu receiver:
+
+```bash
+./scripts/receive_udp.sh [PORT]
+```
+
+Or run the receiver manually:
 
 ```bash
 gst-launch-1.0 -v \
     udpsrc port=5000 \
-    caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! \
-    rtph264depay ! \
-    h264parse ! \
-    avdec_h264 ! \
+    caps="application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000" ! \
+    rtpjpegdepay ! \
+    jpegdec ! \
     videoconvert ! \
     autovideosink sync=false
 ```
+
+### H.264/RTP — Alternative
+
+An H.264/RTP path is also provided using the BeagleY-AI Wave5 hardware encoder.
+
+On the BeagleY-AI:
+
+```bash
+./scripts/stream_h264_udp.sh <HOST_IP> [PORT]
+```
+
+On the Ubuntu receiver:
+
+```bash
+./scripts/receive_h264_udp.sh [PORT]
+```
+
+The H.264 path provides lower network bandwidth than JPEG/RTP, but the tested capture-to-encoder pipeline has lower sustained throughput than the JPEG/RTP path.
+
+### Performance Notes
+
+The tested 1280 × 720 JPEG/RTP pipeline achieved approximately 28.6 FPS. JPEG quality 75 produced approximately 119 kB per frame, or roughly 28 Mb/s.
+
+The H.264 encoder itself can sustain 30 FPS at 1280 × 720 when running without competing processing, but the complete capture-to-encoder pipeline measured approximately 25 FPS.
+
+The H.264 streaming geometry is 1280 × 720 because the Wave5 encoder requires dimensions aligned to its supported block size.
+
+For the validated ISP path, TI TIOVX/DCC remains available separately from the canonical live-stream path.
 
 ## Reproduction
 
@@ -190,7 +218,8 @@ The bring-up can be reproduced in stages:
 4. Validate raw capture using `scripts/capture_raw.sh`.
 5. Generate the DCC binaries using `scripts/generate_dcc.sh` and a compatible TI Imaging installation.
 6. Install the generated DCC files under `/opt/imaging/imx296/linear/`.
-7. Start the RTP/UDP stream using `scripts/stream_udp.sh`.
+7. Build `tools/imx296-capture`.
+8. Start the JPEG/RTP stream using `scripts/stream_udp.sh`.
 
 ### TI Imaging dependency
 

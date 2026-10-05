@@ -20,10 +20,12 @@ The repository contains the project-specific IMX296 kernel driver source, device
 | Raw V4L2 pixel format | `BG10` |
 | ISP output | NV12 |
 | Hardware H.264 encoder | Wave5 / `v4l2h264enc` |
-| Network stream | RTP/H.264 over UDP, port 5000 |
+| Network stream | JPEG/RTP over UDP, port 5000 (current canonical stream); H.264/RTP remains an alternative |
 | Host-side GStreamer | 1.22.x on the receiver used during validation |
 
 The board used during validation had the IMX296 connected to the camera module connector(s) described by the CSI0 and CSI1 overlays in `dts/`.
+
+The current live-stream implementation uses the repository's `imx296-capture` utility. The TI TIOVX/DCC path remains a validated ISP path, but its older end-to-end H.264 pipeline is not the current performance baseline.
 
 ## 2. Repository layout
 
@@ -67,10 +69,10 @@ The IMX296 driver is therefore built as an out-of-tree kernel module in the vali
 
 ## 4. Build the IMX296 kernel module
 
-The validated kernel build tree on the board was:
+The validated kernel build tree on the board is:
 
 ```text
-/home/rebhu/kbuild
+~/kernel/kbuild
 ```
 
 The driver source in this repository is copied to an external-module directory containing:
@@ -79,11 +81,18 @@ The driver source in this repository is copied to an external-module directory c
 obj-m += imx296.o
 ```
 
-For the validated kernel tree, the reproducible external-module build is:
+For a generic checkout, build the external module with the matching kernel tree:
 
 ```bash
-cd /home/rebhu/imx296mod
-make -C /home/rebhu/kbuild M=$PWD KBUILD_MODPOST_WARN=1 modules
+cd /path/to/imx296mod
+make -C /path/to/kernel/tree M=$PWD KBUILD_MODPOST_WARN=1 modules
+```
+
+On the validated BeagleY-AI filesystem, the same build was reproduced from:
+
+```bash
+cd ~/work/imx296/imx296mod
+make -C ~/kernel/kbuild M=$PWD KBUILD_MODPOST_WARN=1 modules
 ```
 
 A build produces:
@@ -98,7 +107,7 @@ Module.symvers
 
 ### Why `KBUILD_MODPOST_WARN=1` is present
 
-The validated `/home/rebhu/kbuild` tree did not contain a kernel-level `Module.symvers`. Without it, `modpost` stopped with unresolved-symbol errors. With `KBUILD_MODPOST_WARN=1`, those unresolved symbols are emitted as warnings and the module is linked successfully.
+The validated `~/kernel/kbuild` tree did not contain a kernel-level `Module.symvers`. Without it, `modpost` stopped with unresolved-symbol errors. With `KBUILD_MODPOST_WARN=1`, those unresolved symbols are emitted as warnings and the module is linked successfully.
 
 A fully built kernel tree that provides a matching `Module.symvers` is preferable for a conventional external-module build; this repository documents the exact procedure that was validated on the target board.
 
@@ -431,51 +440,109 @@ An exposure around `1350` removed the visible flicker encountered during earlier
 
 The current repository configuration intentionally does not pursue additional color-correction tuning. For visual-inertial use, the luminance/structure of the image is more important than matching RGB color appearance.
 
-## 14. End-to-end UDP stream
+## 14. Current live-stream path
 
-The validated BeagleY-AI to host pipeline is:
+The current validated low-complexity streaming path uses the project-specific `imx296-capture` utility rather than the older TIOVX-to-H.264 pipeline as the canonical live-stream command.
 
-```bash
-sudo gst-launch-1.0 -q \
-    v4l2src device=/dev/video2 io-mode=5 ! \
-    'video/x-bayer,format=bggr10,width=1456,height=1088,framerate=30/1' ! \
-    tiovxisp \
-        sensor-name=SENSOR_SONY_IMX296_RPI \
-        dcc-isp-file=/opt/imaging/imx296/linear/dcc_viss.bin \
-        format-msb=9 \
-        sink_0::dcc-2a-file=/opt/imaging/imx296/linear/dcc_2a.bin \
-        sink_0::ae-mode=2 \
-        sink_0::awb-mode=0 \
-        sink_0::device=/dev/v4l-subdev2 ! \
-    'video/x-raw,format=NV12,width=1456,height=1088' ! \
-    videoscale ! \
-    'video/x-raw,format=NV12,width=1280,height=720,framerate=30/1' ! \
-    queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! \
-    v4l2h264enc ! \
-    h264parse config-interval=1 ! \
-    rtph264pay pt=96 config-interval=1 mtu=1400 ! \
-    udpsink host=HOST_IP port=5000 sync=false async=false
+The canonical capture utility is now:
+
+```text
+~/work/imx296/tools/imx296-capture
 ```
 
-Replace `HOST_IP` with the IP address of the receiving machine.
+It performs the software demosaic/conversion path and now crops the 1456-wide sensor image to 1280x720 internally. The crop is not a software rescale, so this avoids a separate `videoscale` stage.
 
-The repository helper is:
+The canonical utility also clamps the post-white-balance Y/U/V values to the valid 8-bit range before writing them. This fixes the earlier `uint8_t` wraparound defect where gain values above 255 could wrap and create false pink/green pixels. The older `imx296-capture-clamped` and `imx296-capture-green-test` programs remain experimental/reference variants and are not the canonical tool.
+
+### JPEG/RTP stream
+
+The best measured live-stream path is JPEG over RTP/UDP. During validation it reached approximately 28.6 FPS over a 17.3 s run at 1280x720 with AWB locked (`R=G=B`). It is therefore close to 30 FPS, but the measured result should not be described as a sustained 30 FPS stream.
+
+On the BeagleY-AI:
 
 ```bash
-scripts/stream_udp.sh HOST_IP [PORT]
+~/work/imx296/tools/imx296-capture --stdout --fps 30 --order bggr --awb /dev/media1 | \
+gst-launch-1.0 -q fdsrc fd=0 blocksize=1843200 do-timestamp=true ! \
+  rawvideoparse format=yuy2 width=1280 height=720 framerate=30/1 ! \
+  queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! \
+  jpegenc quality=75 ! \
+  rtpjpegpay pt=26 mtu=1400 ! \
+  udpsink host=HOST_IP port=5000 sync=false async=false
 ```
 
-The helper intentionally takes the host IP as an argument instead of embedding the developer's private network address.
+Replace `HOST_IP` with the receiving machine's address. A quality around 60 can be used when lower bandwidth is preferred. At quality 75, the measured stream was approximately 119 kB/frame, or about 28 Mb/s.
+
+On the receiving Linux host:
+
+```bash
+gst-launch-1.0 -v \
+  udpsrc port=5000 \
+  caps="application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000" ! \
+  rtpjpegdepay ! \
+  jpegdec ! \
+  videoconvert ! \
+  autovideosink sync=false
+```
+
+`rtpjpegpay` does not have a `config-interval` property; adding one results in a pipeline error.
+
+### H.264/RTP alternative
+
+H.264 is useful when bandwidth is more important than frame rate, but the combined software capture/demosaic path measured approximately 25 FPS at 1280x720 during validation. The Wave5 hardware encoder itself was measured at 30 FPS when used without the competing software path.
+
+A representative H.264 path is:
+
+```text
+imx296-capture
+    -> rawvideoparse (YUY2 1280x720)
+    -> queue
+    -> videoconvert
+    -> NV12 1280x720
+    -> v4l2h264enc
+    -> h264parse
+    -> rtph264pay
+    -> udpsink
+```
+
+The earlier TIOVX -> NV12 -> `videoscale` -> Wave5 pipeline remains useful for validating the TI ISP/TIOVX path, but it should not be treated as the current performance baseline for live streaming.
+
+### Performance notes
+
+The measured behavior on the validated board was:
+
+| Path | Measured result |
+| --- | ---: |
+| Capture tool alone (software demosaic) | 446 frames / 15.3 s = 29.2 FPS |
+| Wave5 encoder, live 720p30, no competing software path | 450 / 450 = 30 FPS |
+| Capture tool -> parse -> videoconvert -> H.264 encoder | 248 / 15 s = 16.5 FPS |
+| Same H.264 path with a non-leaky queue | ~25 FPS, with frame loss |
+| Capture tool -> parse -> JPEG -> RTP/UDP | 495 / 17.3 s = 28.6 FPS |
+
+The stream queues in the original H.264 command were leaky, so frames could be discarded when the pipeline could not keep up. This is a source of apparent lag even when the encoder itself is capable of the target rate.
+
+The hardware H.264 encoder also expects dimensions compatible with its alignment requirements; the validated streaming paths use 1280x720 after the capture tool's crop.
 
 ## 15. Host-side receiver
 
-On the receiving Linux machine:
+For the current JPEG/RTP stream, use:
+
+```bash
+gst-launch-1.0 -v \
+  udpsrc port=5000 \
+  caps="application/x-rtp,media=video,encoding-name=JPEG,payload=26,clock-rate=90000" ! \
+  rtpjpegdepay ! \
+  jpegdec ! \
+  videoconvert ! \
+  autovideosink sync=false
+```
+
+For the older H.264/TIOVX path documented above, the receiver remains:
 
 ```bash
 scripts/receive_udp.sh 5000
 ```
 
-The underlying GStreamer pipeline is:
+with:
 
 ```bash
 gst-launch-1.0 -v \
@@ -559,11 +626,12 @@ A fresh bring-up should reach these checkpoints in order:
 [ ] media graph is SBGGR10_1X10 / 1456x1088
 [ ] /dev/video2 exposes BG10 / 1456x1088
 [ ] raw V4L2 capture succeeds
-[ ] TIOVX ISP opens with SENSOR_SONY_IMX296_RPI
-[ ] DCC files load successfully
-[ ] ISP produces NV12
-[ ] Wave5 H.264 encoder starts
-[ ] RTP/UDP stream reaches the host
+[ ] TIOVX ISP opens with SENSOR_SONY_IMX296_RPI (when using the ISP path)
+[ ] DCC files load successfully (for the ISP path)
+[ ] ISP produces NV12 (for the ISP path)
+[ ] `imx296-capture` produces 1280x720 YUY2 frames
+[ ] JPEG/RTP stream reaches the host
+[ ] Optional Wave5 H.264 path starts
 ```
 
 ## 18. Reproducibility notes
