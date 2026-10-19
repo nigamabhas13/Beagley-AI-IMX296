@@ -57,8 +57,13 @@ IMX296 --> CSI-2 --> CSI2RX --> V4L2
                                                     +--> H.264 --> RTP/UDP --> Host
 ```
 
-The `imx296-capture` path is the current canonical live-stream path.
-The TI TIOVX/DCC path remains available for ISP processing and validation.
+The recommended live-stream path for the tested external-trigger setup is `scripts/stream_isp_h264_triggered.sh`. It uses the trigger-enabled IMX296 driver, generates XTR pulses through the BeagleY-AI GPIO, and streams through the TI TIOVX ISP and Wave5 H.264 encoder over RTP/UDP. The `imx296-capture` path remains available as an alternative.
+
+### External-triggered ISP/H.264 streaming
+
+Run `./scripts/stream_isp_h264_triggered.sh <receiver-ip> [port]` on the BeagleY-AI; the default UDP port is 5000. The launcher requires the trigger-enabled driver and the IMX296 DCC files under `/opt/imaging/imx296/linear/`. On the tested board, XTR is driven by `gpiochip3`, line offset 8 (physical header pin 11 / GPIO17). Verify the mapping on other system images.
+
+Default trigger timing is 17 ms low and 16 ms high, giving a nominal 33 ms period (about 30 FPS); software-generated pulses may have timing jitter. Set `TRIGGER_LOW` and `TRIGGER_HIGH` to override the timings. Press Ctrl+C to stop; the launcher cleans up the GPIO process and restores `trigger_mode=0` for the next stream start. The lower-level `stream_isp_h264.sh` runs without generating external trigger pulses.
 
 ## Known Working Configuration
 
@@ -206,7 +211,7 @@ The H.264 encoder itself can sustain 30 FPS at 1280 × 720 when running without 
 
 The H.264 streaming geometry is 1280 × 720 because the Wave5 encoder requires dimensions aligned to its supported block size.
 
-For the validated ISP path, TI TIOVX/DCC remains available separately from the canonical live-stream path.
+The external-triggered ISP/H.264 launcher is the recommended live-stream path. The plain `stream_isp_h264.sh` script runs the ISP/encoder pipeline without generating external XTR pulses.
 
 ## Reproduction
 
